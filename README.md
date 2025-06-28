@@ -30,3 +30,10 @@ For CLI usage run:
 
 For Web UI chatbot run: 
 `streamlit run app.py`
+
+
+## ScreenShots
+
+<img src="./assets/Screenshot 2025-06-28 235621.png" width=1000px>
+<img src="./assets/Screenshot 2025-06-28 235816.png" width=1000px>
+<img src="./assets/Screenshot 2025-06-28 235859.png" width=1000px>
