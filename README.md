@@ -15,7 +15,7 @@ for windows : `.\.venv\Scripts\activate`
 
 `pip install -r requirements.txt`
 
-Rename .env_EXAMPLE to .env and paste your api keys. 
+Rename `.env_EXAMPLE` to `.env` and paste your api keys. 
 (Optional: leave as it is for models that won't be used)
 
 Configure LLMs in config.py file\
