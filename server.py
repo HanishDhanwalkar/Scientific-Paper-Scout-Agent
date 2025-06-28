@@ -1,33 +1,35 @@
 # server.py
 from mcp.server.fastmcp import FastMCP
-
-import os
-
 import arxiv
-from PyPDF2 import PdfReader
-from langchain_ollama import ChatOllama
+import os
 
 from helper import summarize, extract_text_from_pdf, download_paper
 
+from llm_handler import get_summarizer_llm_client
+from config import DOWNLOADS_DIR, CURRENT_SUMMARIZER_LLM_PROVIDER, CURRENT_LLM_PROVIDER
+
+llm = get_summarizer_llm_client()
+print(f"Using summarizer LLM: {CURRENT_SUMMARIZER_LLM_PROVIDER}")
+print(f"Using chatbot LLM: {CURRENT_LLM_PROVIDER}")
+
 print("Staring Server....")
-
-DOWNLOADS_DIR = "./Downloads"
-SUMMARIZER_MODEL = "llama3.2"
-
-llm = ChatOllama(model=SUMMARIZER_MODEL)
-
-# Create an MCP server
-mcp = FastMCP(name="Demo")
+mcp = FastMCP(name="Demo") # Create an MCP server
 
 
-# Add an addition tool
+# # Add an addition tool
+# @mcp.tool()
+# def add(a: int, b: int) -> int:
+#     """Add two numbers"""
+#     return a + b
+
+# # Add a resource
+# @mcp.resource("greeting://{name}")
+# def get_greeting(name: str) -> str:
+#     """Get a personalized greeting"""
+#     return f"Hello, {name}!"
+
 @mcp.tool()
-def add(a: int, b: int) -> int:
-    """Add two numbers"""
-    return a + b
-
-@mcp.tool()
-def query_arxiv(query: str, max_results: int) -> list[dict]:
+def query_arxiv(query: str, max_results: int=3) -> list[dict]:
     """
     Queries the public arXiv API using the 'arxiv' Python package
     and returns up to max_results items.
@@ -50,11 +52,13 @@ def query_arxiv(query: str, max_results: int) -> list[dict]:
 
         results = []
         for result in search.results():
-            results.append({
+            results.append(
+                {
                 "title": result.title,
                 "pdf_url": result.pdf_url,
-                "summary": result.summary
-            })
+                # "summary": result.summary
+                }
+            )
         return results
 
     except Exception as e:
@@ -62,9 +66,9 @@ def query_arxiv(query: str, max_results: int) -> list[dict]:
         return []
 
 @mcp.tool()
-def summarize_pdf(pdf_url):
+def summarize_paper(pdf_url):
     """
-    Summarize a PDF using the Ollama model
+    Summarize a paper from pdf_url of the paper
 
     Args:
         pdf_url (str): The URL of the PDF to summarize
@@ -84,8 +88,8 @@ def summarize_pdf(pdf_url):
     
     text = extract_text_from_pdf(pdf_path)
 
-    # Optional: limit very large texts
-    if len(text) > 8000:
+    # limiting very large texts
+    if len(text) > 15000:
         print("PDF is too long, summarizing only the first 8000 characters.")
         text = text[:8000]
         
@@ -94,10 +98,3 @@ def summarize_pdf(pdf_url):
     print("Sending to Ollama for summarization...")
     summary = summarize(text, llm)
     return summary
-
-
-# # Add a dynamic greeting resource
-# @mcp.resource("greeting://{name}")
-# def get_greeting(name: str) -> str:
-#     """Get a personalized greeting"""
-#     return f"Hello, {name}!"
