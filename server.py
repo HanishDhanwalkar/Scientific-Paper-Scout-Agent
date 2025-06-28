@@ -1,7 +1,21 @@
 # server.py
 from mcp.server.fastmcp import FastMCP
 
+import os
+
+import arxiv
+from PyPDF2 import PdfReader
+from langchain_ollama import ChatOllama
+
+from helper import summarize, extract_text_from_pdf, download_paper
+
 print("Staring Server....")
+
+DOWNLOADS_DIR = "./Downloads"
+SUMMARIZER_MODEL = "llama3.2"
+
+llm = ChatOllama(model=SUMMARIZER_MODEL)
+
 # Create an MCP server
 mcp = FastMCP(name="Demo")
 
@@ -12,9 +26,78 @@ def add(a: int, b: int) -> int:
     """Add two numbers"""
     return a + b
 
+@mcp.tool()
+def query_arxiv(query: str, max_results: int) -> list[dict]:
+    """
+    Queries the public arXiv API using the 'arxiv' Python package
+    and returns up to max_results items.
 
-# Add a dynamic greeting resource
-@mcp.resource("greeting://{name}")
-def get_greeting(name: str) -> str:
-    """Get a personalized greeting"""
-    return f"Hello, {name}!"
+    Args:
+        query (str): The search query string (e.g., "large language models").
+        max_results (int): The maximum number of results to return.
+
+    Returns:
+        list[dict]: A list of dictionaries, where each dictionary represents an
+                    arXiv article with its title, authors, summary, and primary link.
+                    Returns an empty list if no results are found or an error occurs.
+    """
+    try:
+        search = arxiv.Search(
+            query=query,
+            max_results=max_results,
+            sort_by=arxiv.SortCriterion.Relevance,
+        )
+
+        results = []
+        for result in search.results():
+            results.append({
+                "title": result.title,
+                "pdf_url": result.pdf_url,
+                "summary": result.summary
+            })
+        return results
+
+    except Exception as e:
+        print(f"An error occurred while querying arXiv: {e}")
+        return []
+
+@mcp.tool()
+def summarize_pdf(pdf_url):
+    """
+    Summarize a PDF using the Ollama model
+
+    Args:
+        pdf_url (str): The URL of the PDF to summarize
+
+    Returns:
+        str: A summary of the PDF
+    """
+    global DOWNLOADS_DIR
+    
+    if pdf_url is None:
+        raise ValueError("PDF URL is required.")
+    
+    pdf_path = download_paper(pdf_url=pdf_url, download_dir=DOWNLOADS_DIR)
+    
+    if not os.path.isfile(pdf_path):
+        raise FileNotFoundError(f"{pdf_path} does not exist.")
+    
+    text = extract_text_from_pdf(pdf_path)
+
+    # Optional: limit very large texts
+    if len(text) > 8000:
+        print("PDF is too long, summarizing only the first 8000 characters.")
+        text = text[:8000]
+        
+    global llm
+
+    print("Sending to Ollama for summarization...")
+    summary = summarize(text, llm)
+    return summary
+
+
+# # Add a dynamic greeting resource
+# @mcp.resource("greeting://{name}")
+# def get_greeting(name: str) -> str:
+#     """Get a personalized greeting"""
+#     return f"Hello, {name}!"
