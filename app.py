@@ -1,342 +1,796 @@
-import streamlit as st
 import asyncio
-import threading
-import queue
-import time
-import os 
+import json
+import os
+import re
+import sys
+from contextlib import AsyncExitStack
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from llm import call_llm, convert_to_llm_tool 
+from llm import call_llm, convert_to_llm_tool
 
-# --- Streamlit App Configuration ---
-st.set_page_config(layout="centered", page_title="MCP Chatbot")
+import streamlit as st
 
-# --- Session State Initialization (More robust) ---
-st.session_state.messages = st.session_state.get("messages", [])
-st.session_state.mcp_worker_thread_started = st.session_state.get("mcp_worker_thread_started", False)
-st.session_state.mcp_initialized_success = st.session_state.get("mcp_initialized_success", False)
-st.session_state.mcp_manager = st.session_state.get("mcp_manager", None)
+# --- Asyncio Event Loop Policy for Windows ---
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# --- Global Queues for Inter-Thread Communication ---
-# These queues facilitate thread-safe communication between the Streamlit main thread and the separate MCP worker thread.
-request_queue = queue.Queue()  # Streamlit UI -> MCP Worker Thread (for sending commands like tool calls)
-response_queue = queue.Queue() # MCP Worker Thread -> Streamlit UI (for sending back results/errors/status)
+# --- Add Project Root to Python Path ---
+PROJECT_ROOT = os.path.dirname(
+    os.path.abspath(__file__)
+)
+print(f"Project dir: {PROJECT_ROOT}")
 
-# --- Global Flag for MCP Initialization Status ---
-mcp_initialized_event = threading.Event()
+sys.path.insert(0, PROJECT_ROOT)
 
-# --- MCP Client Manager Class (Designed to run in a separate thread) ---
-class MCPClientManager:
-    def __init__(self):
-        self._session = None      # Holds the MCP ClientSession instance
-        self._functions = []      # Stores the LLM-compatible tool definitions
-        self._event_loop = None   # Each thread needs its own dedicated asyncio event loop
+# # --- Streamlit Logo Configuration ---
+# st.logo(
+#     os.path.join(PROJECT_ROOT, "assets", "mcp_chatbot_logo.png"),
+#     size="large",
+# )
 
-    async def _initialize_mcp_client(self, ui_response_queue):
-        """
-        Asynchronous initialization method for the MCP client.
-        Sends status messages to the UI via the provided queue.
-        """
-        # Send initial status to the UI
-        ui_response_queue.put(("init_status", "INFO", "Establishing stdio client connection..."))
+# --- Streamlit Page Configuration ---
+st.set_page_config(page_title="MCP Chatbot", layout="wide")
+st.title("⚙️ MCP Chatbot - Interactive Agent")
+st.caption(
+    "A chatbot that uses the Model Context Protocol (MCP) to interact with tools."
+)
 
-        # Define the parameters for starting the MCP server process.
-        # It assumes 'server.py' is runnable via 'mcp run server.py'.
-        # Set PYTHONUNBUFFERED to 1 to ensure subprocess output is not buffered,
-        # which can help with real-time communication over pipes.
-        env_vars = os.environ.copy()
-        env_vars["PYTHONUNBUFFERED"] = "1"
-        server_params = StdioServerParameters(
-            command="mcp",
-            args=["run", "server.py"],
-            env=env_vars,
-        )
+# --- Session State Initialization ---
+# Streamlit's session_state is used to preserve data across reruns of the script.
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # Stores the UI chat messages (user/assistant)
 
+if "llm_provider" not in st.session_state:
+    st.session_state.llm_provider = "openai"  # Default LLM provider
+
+# TODO: Use config.py
+if "llm_config" not in st.session_state:
+    st.session_state.llm_config = {
+        "openai_model_name": "gpt-3.5-turbo",
+        "openai_api_key": "",
+        "openai_base_url": "",
+        "ollama_model_name": "llama3.2",
+        "ollama_base_url": "http://localhost:11434",
+    }
+
+if "mcp_tools_cache" not in st.session_state:
+    st.session_state.mcp_tools_cache = {}  # Cache for discovered MCP tools
+
+# State for managing the active MCP client session and its associated configuration hash.
+if "mcp_client_session" not in st.session_state:
+    st.session_state.mcp_client_session = None
+if "session_config_hash" not in st.session_state:
+    st.session_state.session_config_hash = None
+
+# Variables to manage the lifecycle of MCP clients within Streamlit's context.
+if "active_mcp_clients_raw" not in st.session_state:
+    # Stores raw (read, write) pairs or similar handles for direct stdio_client interaction
+    st.session_state.active_mcp_clients_raw = []
+if "mcp_client_stack" not in st.session_state:
+    # AsyncExitStack manages the context of multiple async clients.
+    st.session_state.mcp_client_stack = None
+
+if "llm_message_history" not in st.session_state:
+    # This stores the message history *specifically for the LLM call*,
+    # which includes system prompts, user queries, tool calls, and tool outputs.
+    st.session_state.llm_message_history = []
+
+
+# --- Constants for Workflow Visualization ---
+WORKFLOW_ICONS = {
+    "USER_QUERY": "👤",
+    "LLM_THINKING": "☁️",
+    "LLM_RESPONSE": "💬",
+    "TOOL_CALL": "🔧",
+    "TOOL_EXECUTION": "⚡️",
+    "TOOL_RESULT": "📊",
+    "FINAL_STATUS": "✅",
+    "ERROR": "❌",
+    "JSON_TOOL_CALL": "📜",
+}
+
+# --- DataClass for Workflow Step ---
+@dataclass
+class WorkflowStep:
+    """
+    Represents a single step in the chatbot's interaction workflow.
+    This helps in visualizing the internal thought process and tool usage.
+    """
+    type: str
+    content: str
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts the WorkflowStep instance to a dictionary."""
+        return asdict(self)
+
+
+async def get_mcp_tools(force_refresh=False) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Retrieves MCP tools from cache or by initializing MCP clients to list them.
+    This function now directly uses mcp.ClientSession and stdio_client.
+
+    Args:
+        force_refresh (bool): If True, bypass the cache and re-initialize clients.
+
+    Returns:
+        Dict[str, List[Dict[str, Any]]]: A dictionary mapping client names to lists of their tool dictionaries.
+    """
+    if not force_refresh and st.session_state.mcp_tools_cache:
+        return st.session_state.mcp_tools_cache
+
+    server_path = os.path.join(PROJECT_ROOT, "server.py")
+
+    # Use a temporary AsyncExitStack for tool discovery
+    async with AsyncExitStack() as stack:
         try:
-            # Use async with for proper context management.
-            # This ensures __aexit__ is called correctly when the blocks are exited.
-            async with stdio_client(server_params) as (reader, writer):
-                # The reader and writer are managed by stdio_client's context manager.
-                # We don't store them directly as self._reader, self._writer if not strictly needed
-                # for later direct access, as their lifecycle is tied to this `async with` block.
-                # If they were needed after this block, manual __aenter__ and __aexit__ calls
-                # would be necessary with careful context management.
-                async with ClientSession(reader, writer) as session:
-                    self._session = session # Store the session object for subsequent tool calls
-                    ui_response_queue.put(("init_status", "INFO", "Initializing MCP session..."))
-                    await self._session.initialize()
-
-                    ui_response_queue.put(("init_status", "INFO", "Listing available tools..."))
-                    tools_response = await self._session.list_tools()
-                    # Convert the MCP tool definitions into a format suitable for the LLM.
-                    self._functions = [convert_to_llm_tool(tool) for tool in tools_response.tools]
-
-                    ui_response_queue.put(("init_status", "SUCCESS", "MCP Client Initialized Successfully!"))
-                    return True # Indicate success of initialization within this scope
-
-        except Exception as e:
-            # Send error status to the UI
-            ui_response_queue.put(("init_status", "ERROR", f"Error during MCP client setup: {e}"))
-            print(f"MCP Worker Thread: Initialization error: {e}") # Debug print
-            return False # Indicate failure
-
-    async def _process_requests(self, request_q, response_q):
-        """
-        Asynchronous loop to continuously process requests received from the main Streamlit thread.
-        This loop runs within the dedicated asyncio event loop of the worker thread.
-        """
-        while True:
-            try:
-                # Use get_nowait() to poll the synchronous queue without blocking the asyncio loop.
-                # If the queue is empty, a queue.Empty exception is raised.
-                request_type, data, request_id = request_q.get_nowait()
-            except queue.Empty:
-                # If the queue is empty, pause briefly to avoid busy-waiting and yield control.
-                await asyncio.sleep(0.01) # Sleep for a very short duration
-                continue # Continue to the next iteration of the loop to poll again
-
-            print(f"MCP Worker Thread: Received request: {request_type} (ID: {request_id})")
-
-            if request_type == "CALL_TOOL":
-                tool_name, tool_args = data
-                try:
-                    if not self._session:
-                        # This should ideally not happen if initialization was successful,
-                        # but as a safeguard.
-                        raise RuntimeError("MCP session not available for tool call.")
-                    # Execute the tool call via the MCP session.
-                    result = await self._session.call_tool(tool_name, arguments=tool_args)
-                    # Put the successful result back into the response queue for the Streamlit UI.
-                    response_q.put((request_id, "SUCCESS", result))
-                except Exception as e:
-                    # If a tool call fails, send an error response to the UI.
-                    print(f"MCP Worker Thread: Error calling tool {tool_name}: {e}")
-                    response_q.put((request_id, "ERROR", str(e)))
-            elif request_type == "SHUTDOWN":
-                # If a shutdown request is received, break out of the loop to terminate the thread.
-                print("MCP Worker Thread: Shutting down gracefully.")
-                break
-            else:
-                # Handle unknown request types.
-                print(f"MCP Worker Thread: Unknown request type: {request_type}")
-                response_q.put((request_id, "ERROR", "Unknown request type"))
-
-    def start_mcp_listener_thread(self, ui_response_queue):
-        """
-        This method is the entry point for the dedicated MCP worker thread.
-        It sets up its own asyncio event loop and orchestrates the MCP client's lifecycle.
-        """
-        # Create a new asyncio event loop for this specific thread.
-        self._event_loop = asyncio.new_event_loop()
-        # Set this new loop as the current event loop for this thread.
-        asyncio.set_event_loop(self._event_loop)
-        
-        try:
-            # First, run the asynchronous MCP client initialization.
-            # This call blocks this thread until initialization is complete.
-            init_success = self._event_loop.run_until_complete(
-                self._initialize_mcp_client(ui_response_queue)
+            server_params = StdioServerParameters(
+                command="mcp",
+                args=["run", server_path],
+                env=None,
             )
             
-            # After initialization, signal to the main Streamlit thread about the status.
-            if init_success:
-                # IMPORTANT: DO NOT set st.session_state here directly from worker thread.
-                # Only update global `mcp_initialized_event` and let main thread set session_state.
-                mcp_initialized_event.set() # Unblock the main thread's wait()
-                print("MCP Worker Thread: Client initialized. Starting request processing loop.")
-                # If initialization was successful, start the loop for processing incoming requests.
-                self._event_loop.run_until_complete(
-                    self._process_requests(request_queue, response_queue)
-                )
-            else:
-                # If initialization failed, still set the event to unblock the main thread.
-                # IMPORTANT: DO NOT set st.session_state here directly from worker thread.
-                mcp_initialized_event.set()
-                print("MCP Worker Thread: Client initialization failed. Exiting.")
+            read, write = await stack.enter_async_context(stdio_client(server_params))
+                    
+            # Create an MCP ClientSession using the read/write streams
+            client_session = await stack.enter_async_context(ClientSession(read, write))
+            await client_session.initialize() # Initialize the session
 
+            tools = await client_session.list_tools()
+            functions = []
+            for tool in tools.tools:
+                # tool_name = tool.name
+                # tool_input_schema = tool.inputSchema["properties"]
+                # # functions.append({
+                # #     "name": tool_name,
+                # #     "input_schema": tool_input_schema
+                # # })
+                functions.append(convert_to_llm_tool(tool))
         except Exception as e:
-            # Catch any unexpected critical errors that occur during the thread's main operation.
-            print(f"MCP Worker Thread: Critical error in main loop: {e}")
-            # Ensure the event is set to prevent the main thread from getting stuck.
-            mcp_initialized_event.set()
-            # Also send an error message to the UI for visibility via the queue.
-            ui_response_queue.put(("init_status", "ERROR", f"Critical error in worker thread: {e}"))
-        finally:
-            # Ensure the event loop is closed when the thread is done.
-            if self._event_loop and not self._event_loop.is_closed():
-                self._event_loop.close()
-            print("MCP Worker Thread: Event loop closed. Thread exiting.")
+            st.sidebar.error(f"Error fetching tools: {e}")
+
+    st.session_state.mcp_tools_cache = functions
+    return functions
 
 
-# --- Start the MCP Worker Thread (executed once per Streamlit app run) ---
-# This ensures the background thread is only created and started one time.
-# The initial state is set to False at the very top of the script.
-if not st.session_state.mcp_worker_thread_started:
-    st.session_state.mcp_worker_thread_started = True # Mark as started immediately
-    print("Main Thread: Starting MCP Worker Thread...")
-    
-    # Create an instance of the MCPClientManager.
-    manager = MCPClientManager()
-    # Create and start the new thread.
-    # We pass the global `response_queue` to the thread so it can send messages back to the UI.
-    mcp_thread = threading.Thread(
-        target=manager.start_mcp_listener_thread,
-        args=(response_queue,), # Pass the queue as an argument
-        daemon=True # Daemon threads exit automatically when the main program exits
-    )
-    mcp_thread.start() # Start the background thread.
+def render_sidebar(mcp_tools: Optional[Dict[str, List[Dict[str, Any]]]] = None):
+    """
+    Renders the Streamlit sidebar with settings for LLM and MCP,
+    and control buttons like "Clear Chat" and "Refresh Tools".
+    """
+    with st.sidebar:
+        st.header("Settings")
 
-    # Display a loading spinner in the Streamlit UI while waiting for MCP initialization.
-    # The main thread actively monitors the response_queue for initialization status.
-    with st.spinner("Connecting to MCP server and loading tools..."):
-        init_status = "PENDING"
-        max_wait_time = 180 # Increased timeout for potentially slower server starts or first-time setup
-        start_time = time.time()
-        while init_status == "PENDING" and (time.time() - start_time) < max_wait_time:
-            try:
-                # Poll the response queue for initialization status messages.
-                # Use a short timeout to prevent blocking the Streamlit UI indefinitely.
-                msg_id, msg_type, msg_data = response_queue.get(timeout=0.1) # Shorter poll interval
-                if msg_id == "init_status":
-                    if msg_type == "INFO":
-                        st.info(msg_data) # Display informative messages
-                    elif msg_type == "SUCCESS":
-                        st.success(msg_data) # Display success message
-                        init_status = "SUCCESS"
-                        st.session_state.mcp_initialized_success = True # Update session state in main thread
-                        st.session_state.mcp_manager = manager # Store the manager instance for later use
-                    elif msg_type == "ERROR":
-                        st.error(msg_data) # Display error message
-                        init_status = "ERROR"
-                        st.session_state.mcp_initialized_success = False # Update session state in main thread
-                        break # Exit the loop on error
-            except queue.Empty:
-                pass # Keep waiting if the queue is empty
-        
-        # After the loop (either success, error, or timeout)
-        if init_status == "PENDING": # If loop exited due to timeout
-            st.error(f"MCP client initialization timed out after {max_wait_time} seconds. Please check server.py and your MCP installation.")
-            st.session_state.mcp_initialized_success = False
-        
-    # If initialization was not successful, stop the Streamlit app.
-    # This check now relies on the `st.session_state.mcp_initialized_success` set by the main thread.
-    if not st.session_state.mcp_initialized_success:
-        st.stop()
+        # --- Clear Chat Button ---
+        if st.button("🧹 Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.mcp_client_session = None
+            st.session_state.session_config_hash = None
+            st.session_state.active_mcp_clients_raw = []
+            # Ensure the AsyncExitStack is properly closed if it exists from a previous run
+            if st.session_state.mcp_client_stack:
+                try:
+                    # Manually exit the stack to ensure clients are closed.
+                    # This is a synchronous call in a synchronous context, but it triggers
+                    # the __aexit__ which runs in the current event loop.
+                    asyncio.run(st.session_state.mcp_client_stack.__aexit__(None, None, None))
+                except Exception as e:
+                    print(f"Error during clear chat cleanup: {e}", file=sys.stderr)
+            st.session_state.mcp_client_stack = None
+            st.session_state.llm_message_history = [] # Clear LLM's internal history
+            st.toast("Chat cleared!", icon="🧹")
+            st.rerun()
 
+        llm_tab, mcp_tab = st.tabs(["LLM", "MCP"])
+        with llm_tab:
+            st.session_state.llm_provider = st.radio(
+                "LLM Provider:",
+                ["openai", "ollama"],
+                index=["openai", "ollama"].index(st.session_state.llm_provider),
+                key="llm_provider_radio",
+            )
 
-# --- Main Streamlit App Content ---
-st.title("Interactive MCP Chatbot")
+            # TODO: Use config.py
+            llm_config = st.session_state.llm_config
+            if st.session_state.llm_provider == "openai":
+                llm_config["openai_model_name"] = st.text_input(
+                    "OpenAI Model Name:",
+                    value=llm_config.get("openai_model_name", "gpt-3.5-turbo"),
+                    placeholder="e.g. gpt-4o",
+                    key="openai_model_name",
+                )
+                llm_config["openai_api_key"] = st.text_input(
+                    "OpenAI API Key:",
+                    value=llm_config.get("openai_api_key", ""),
+                    type="password",
+                    key="openai_api_key",
+                )
+                llm_config["openai_base_url"] = st.text_input(
+                    "OpenAI Base URL (optional):",
+                    value=llm_config.get("openai_base_url", ""),
+                    key="openai_base_url",
+                )
+            else:  # ollama
+                llm_config["ollama_model_name"] = st.text_input(
+                    "Ollama Model Name:",
+                    value=llm_config.get("ollama_model_name", "llama3"),
+                    placeholder="e.g. llama3",
+                    key="ollama_model_name",
+                )
+                llm_config["ollama_base_url"] = st.text_input(
+                    "Ollama Base URL:",
+                    value=llm_config.get("ollama_base_url", "http://localhost:11434"),
+                    key="ollama_base_url",
+                )
 
-# Display all messages from the chat history.
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        with mcp_tab:
+            # --- Refresh Tools Button ---
+            if st.button("🔄 Refresh Tools", use_container_width=True, type="primary"):
+                st.session_state.mcp_tools_cache = {}
+                st.session_state.mcp_client_session = None # Reset client session on tool refresh
+                st.session_state.session_config_hash = None
+                st.session_state.active_mcp_clients_raw = []
+                if st.session_state.mcp_client_stack:
+                    try:
+                        asyncio.run(st.session_state.mcp_client_stack.__aexit__(None, None, None))
+                    except Exception as e:
+                        print(f"Error during refresh tools cleanup: {e}", file=sys.stderr)
+                st.session_state.mcp_client_stack = None
+                st.session_state.llm_message_history = []
+                st.toast("Tools refreshed and session reset.", icon="🔄")
+                st.rerun()
 
-# Accept user input at the bottom of the chat interface.
-user_prompt = st.chat_input("Type your message here...")
+            if not mcp_tools:
+                st.info("No MCP tools loaded or configured.")
 
-if user_prompt:
-    # Append the user's message to the chat history.
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
-    # Display the user's message immediately in the UI.
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
+            with st.expander(f"({len(mcp_tools)} tools)"):
+                total_tools = len(mcp_tools)
+                for idx, mcp_tool in enumerate(mcp_tools):
+                        st.markdown(f"**Tool {idx + 1}: `{mcp_tool['function']['name']}`**")
+                        st.caption(f"{mcp_tool['function']['description']}")
+                        with st.popover("Schema"):
+                            st.json(mcp_tool["function"]["parameters"]['properties']) # inputSchema
+                        if idx < total_tools - 1:
+                            st.divider()
 
-    # Prepare a placeholder for the assistant's response to allow dynamic updates.
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty() # Creates an empty container for dynamic content
-        full_response_content = "" # This string will accumulate the full response content
+        # --- About Tabs ---
+        en_about_tab, = st.tabs(["About"])
+        with en_about_tab:
+            st.info(
+                "This chatbot uses the Model Context Protocol (MCP) for tool use. "
+                "Configure LLM and MCP settings, then ask questions! "
+                "Use the 'Clear Chat' button to reset the conversation."
+            )
 
-        # Check if the MCP client was successfully initialized.
-        if not st.session_state.mcp_initialized_success:
-            full_response_content = "Error: MCP client is not initialized. Please refresh the page."
-            message_placeholder.markdown(full_response_content)
-        else:
-            # Retrieve the LLM-compatible functions from the initialized MCP manager instance.
-            mcp_functions = st.session_state.mcp_manager._functions
+def extract_json_tool_calls(text: str) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Extracts potential JSON tool call objects from a given text string.
+    This function is generic and does not depend on mcp_chatbot.
+    """
+    tool_calls = []
+    cleaned_text = text
+    json_parsed = False
+
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, list):
+            valid_tools = True
+            for item in data:
+                if not (
+                    isinstance(item, dict) and "tool" in item and "arguments" in item
+                ):
+                    valid_tools = False
+                    break
+            if valid_tools:
+                tool_calls.extend(data)
+                json_parsed = True
+        elif isinstance(data, dict) and "tool" in data and "arguments" in data:
+            tool_calls.append(data)
+            json_parsed = True
+
+        if json_parsed:
+            return tool_calls, ""
+
+    except json.JSONDecodeError:
+        pass
+
+    json_pattern = r"\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}"
+    matches = list(re.finditer(json_pattern, text))
+    extracted_indices = set()
+
+    for match in matches:
+        start, end = match.span()
+        if any(
+            start < prev_end and end > prev_start
+            for prev_start, prev_end in extracted_indices
+        ):
+            continue
+
+        json_str = match.group(0)
+        try:
+            obj = json.loads(json_str)
+            if isinstance(obj, dict) and "tool" in obj and "arguments" in obj:
+                tool_calls.append(obj)
+                extracted_indices.add((start, end))
+        except json.JSONDecodeError:
+            pass
+
+    if extracted_indices:
+        cleaned_parts = []
+        last_end = 0
+        for start, end in sorted(list(extracted_indices)):
+            cleaned_parts.append(text[last_end:start])
+            last_end = end
+        cleaned_parts.append(text[last_end:])
+        cleaned_text = "".join(cleaned_parts).strip()
+    else:
+        cleaned_text = text
+
+    return tool_calls, cleaned_text
+
+def render_workflow(steps: List[WorkflowStep], container=None):
+    """
+    Renders the workflow steps in the Streamlit UI, grouping tool call
+    sequences into expandable sections for clarity.
+    """
+    if not steps:
+        return
+
+    target = container if container else st
+
+    rendered_indices = set()
+
+    for i, step in enumerate(steps):
+        if i in rendered_indices:
+            continue
+
+        step_type = step.type
+
+        if step_type == "TOOL_CALL":
+            tool_name = step.details.get("tool_name", "Unknown Tool")
+            expander_title = f"{WORKFLOW_ICONS['TOOL_CALL']} Tool Call: {tool_name}"
+            with target.expander(expander_title, expanded=False):
+                st.write("**Arguments:**")
+                arguments = step.details.get("arguments", {})
+                if isinstance(arguments, str) and arguments == "Pending...":
+                    st.info("Preparing arguments...")
+                elif isinstance(arguments, dict):
+                    if arguments:
+                        for key, value in arguments.items():
+                            st.write(f"- `{key}`: `{repr(value)}`")
+                    else:
+                        st.write("_No arguments_")
+                else:
+                    st.code(str(arguments), language="json")
+                rendered_indices.add(i)
+
+                j = i + 1
+                while j < len(steps):
+                    next_step = steps[j]
+                    if next_step.type == "TOOL_EXECUTION":
+                        st.write(
+                            f"**Status** {WORKFLOW_ICONS['TOOL_EXECUTION']}: "
+                            f"{next_step.content}"
+                        )
+                        rendered_indices.add(j)
+                    elif next_step.type == "TOOL_RESULT":
+                        st.write(f"**Result** {WORKFLOW_ICONS['TOOL_RESULT']}:")
+                        details = next_step.details
+                        try:
+                            details_dict = json.loads(details)
+                            st.json(details_dict)
+                        except json.JSONDecodeError:
+                            result_str = str(details)
+                            st.text(
+                                result_str[:500]
+                                + ("..." if len(result_str) > 500 else "")
+                                or "_Empty result_"
+                            )
+                        rendered_indices.add(j)
+                        break
+                    elif next_step.type in ["TOOL_CALL", "JSON_TOOL_CALL"]:
+                        break
+                    j += 1
+
+        elif step_type == "JSON_TOOL_CALL":
+            tool_name = step.details.get("tool_name", "Unknown")
+            expander_title = (
+                f"{WORKFLOW_ICONS['JSON_TOOL_CALL']} LLM Generated Tool Call: {tool_name}"
+            )
+            with target.expander(expander_title, expanded=False):
+                st.write("**Arguments:**")
+                arguments = step.details.get("arguments", {})
+                if isinstance(arguments, dict):
+                    if arguments:
+                        for key, value in arguments.items():
+                            st.write(f"- `{key}`: `{value}`")
+                    else:
+                        st.write("_No arguments_")
+                else:
+                    st.code(str(arguments), language="json")
+            rendered_indices.add(i)
+
+        elif step_type == "ERROR":
+            target.error(f"{WORKFLOW_ICONS['ERROR']} {step.content}")
+            rendered_indices.add(i)
+
+# TODO: use config.py
+def get_config_hash(llm_config: Dict[str, Any], provider: str) -> int:
+    """
+    Generates a hash based on relevant LLM configuration settings.
+    This now uses the directly stored `llm_config` dictionary.
+    """
+    relevant_config = {
+        "provider": provider,
+    }
+    if provider == "openai":
+        relevant_config.update(
+            {
+                "model": llm_config.get("openai_model_name"),
+                "api_key": llm_config.get("openai_api_key"),
+                "base_url": llm_config.get("openai_base_url"),
+            }
+        )
+    else:  # ollama
+        relevant_config.update(
+            {
+                "model": llm_config.get("ollama_model_name"),
+                "base_url": llm_config.get("ollama_base_url"),
+            }
+        )
+    return hash(json.dumps(relevant_config, sort_keys=True))
+
+async def initialize_mcp_client_session(stack: AsyncExitStack) -> Optional[ClientSession]:
+    """
+    Initializes a single MCP ClientSession using stdio_client based on servers_config.json.
+    This function now directly uses mcp.ClientSession and stdio_client.
+    It returns the *first successfully initialized* client session found.
+    """
+    server_path = os.path.join(PROJECT_ROOT, "server.py")
+
+    # Use a temporary AsyncExitStack for tool discovery
+    async with AsyncExitStack() as stack:
+        try:
+            server_params = StdioServerParameters(
+                command="mcp",
+                args=["run", server_path],
+                env=None,
+            )
             
-            # Prepare the message history in the format expected by the `call_llm` function.
-            llm_message_history = [
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ]
+            read, write = await stack.enter_async_context(stdio_client(server_params))
+                    
+            # Create an MCP ClientSession using the read/write streams
+            client_session = await stack.enter_async_context(ClientSession(read, write))
+            await client_session.initialize() # Initialize the session
 
-            # Call the LLM to get a response (which might be direct text or a tool call).
-            with st.spinner("Thinking..."):
-                tool_call_present, response = call_llm(llm_message_history, mcp_functions)
+            print("MCP client session initialized")
+            st.toast(f"Connected to MCP server: {server_path}", icon="🔌")
+            
+            return client_session # Return the first successful session
+        except Exception as client_ex:
+            st.error(f"Failed to initialize MCP client  {client_ex}")
+    return None # No client session could be initialized
 
-            if tool_call_present:
-                # If the LLM decided to call one or more tools:
-                for tool_call in response:
-                    tool_name = tool_call['name']
-                    tool_args = tool_call['args']
+async def process_chat(user_input: str):
+    """
+    Handles a user's input, orchestrates the interaction with the LLM and MCP tools,
+    and updates the Streamlit UI with the progress and final response.
+    This function now directly manages the LLM call and MCP tool calls.
+    """
 
-                    # Display tool call details in an expandable section for clarity.
-                    with st.expander(f"Tool Call: `{tool_name}`", expanded=True):
-                        st.json(tool_args) # Display tool arguments in a JSON format
+    # 1. Add user message to state and display it
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-                    # Update the message placeholder to show that a tool is being called.
-                    full_response_content += f"**Calling tool:** `{tool_name}` with arguments: `{tool_args}`\n"
-                    message_placeholder.markdown(full_response_content)
+    # 2. Prepare Streamlit UI elements for the assistant's response.
+    current_workflow_steps = []
+    with st.chat_message("assistant"):
+        status_placeholder = st.status("Processing...", expanded=False)
+        workflow_display_container = st.empty()
+        message_placeholder = st.empty()
+
+    llm_config = st.session_state.llm_config
+    provider = st.session_state.llm_provider
+    current_config_hash = get_config_hash(llm_config, provider)
+
+    try:
+        # --- MCP Client Session Management ---
+        # If config changed or session doesn't exist, re-initialize
+        if (
+            st.session_state.mcp_client_session is None
+            or current_config_hash != st.session_state.session_config_hash
+        ):
+            # Clear previous stack if config changed to ensure old clients are closed
+            if st.session_state.mcp_client_stack:
+                await st.session_state.mcp_client_stack.__aexit__(None, None, None)
+                st.session_state.mcp_client_stack = None
+                st.session_state.llm_message_history = [] # Clear history on session reset
+
+            st.session_state.mcp_client_stack = AsyncExitStack()
+            # initialize_mcp_client_session now returns the mcp.ClientSession directly
+            mcp_client_session = await initialize_mcp_client_session(st.session_state.mcp_client_stack)
+            st.session_state.mcp_client_session = mcp_client_session
+
+            print(mcp_client_session)
+
+            st.session_state.session_config_hash = current_config_hash
+            # Re-initialize LLM's message history if session was reset
+            if not st.session_state.llm_message_history:
+                st.session_state.llm_message_history = [] # Start fresh
+
+
+        mcp_client_session = st.session_state.mcp_client_session
+        if not mcp_client_session:
+            raise RuntimeError("MCP Client Session is not available.")
+
+        # --- Get Tools for LLM ---
+        # List tools via the active MCP client session
+        tools_list_response = await mcp_client_session.list_tools()
+        llm_functions = [convert_to_llm_tool(t) for t in tools_list_response.tools]
+
+        print("Tools:", llm_functions)
+        
+        # Add user query to workflow steps
+        current_workflow_steps.append(
+            WorkflowStep(type="USER_QUERY", content=user_input)
+        )
+        
+        print("Workflow steps:", current_workflow_steps)
+        
+        with workflow_display_container.container():
+            render_workflow(current_workflow_steps, container=st)
+
+        status_placeholder.update(
+            label="🧠 Processing request...", state="running", expanded=False
+        )
+
+        accumulated_response_content = ""
+        tool_call_count = 0
+
+        # Add user message to LLM's internal history
+        st.session_state.llm_message_history.append({"role": "user", "content": user_input})
+
+        # --- Call LLM and process response ---
+        # `call_llm` now includes LLM config details if your llm.py is updated to accept it
+        # For this example, we'll pass it as a separate argument if call_llm expects it
+        # Otherwise, assume llm.py handles config internally (e.g., via environment vars).
+        
+        print(st.session_state.llm_message_history)
+        
+        tool_call_present, llm_response_or_calls = await call_llm(
+            st.session_state.llm_message_history, 
+            llm_functions,
+        )
+
+        if tool_call_present:
+            for tool_call in llm_response_or_calls:
+                tool_name = tool_call['name']
+                arguments = tool_call['args']
+
+                if tool_name and arguments is not None:
+                    tool_call_count += 1
+                    current_workflow_steps.append(
+                        WorkflowStep(
+                            type="TOOL_CALL",
+                            content=f"Initiating call to: {tool_name}",
+                            details={"tool_name": tool_name, "arguments": arguments},
+                        )
+                    )
+                    status_placeholder.update(label=f"🔧 Calling tool: {tool_name}", state="running")
+                    with workflow_display_container.container():
+                        render_workflow(current_workflow_steps, container=st)
 
                     try:
-                        # Generate a unique request ID for this specific tool call.
-                        request_id = str(time.time())
+                        current_workflow_steps.append(
+                            WorkflowStep(type="TOOL_EXECUTION", content=f"Executing {tool_name}...")
+                        )
+                        status_placeholder.update(label=f"⚡ Executing {tool_name}...", state="running")
+                        with workflow_display_container.container():
+                            render_workflow(current_workflow_steps, container=st)
 
-                        # Put the tool call request into the `request_queue` for the worker thread to process.
-                        request_queue.put(("CALL_TOOL", (tool_name, tool_args), request_id))
-
-                        with st.spinner(f"Executing tool `{tool_name}`..."):
-                            status = "PENDING"
-                            result_data = None
-                            max_tool_wait_time = 180 # Maximum time to wait for tool execution in seconds
-                            start_time = time.time()
-                            while status == "PENDING" and (time.time() - start_time) < max_tool_wait_time:
+                        tool_result_obj = await mcp_client_session.call_tool(tool_name, arguments=arguments)
+                        # MCP tool results can be complex. Assuming result.content is a list of parts,
+                        # and we want text from the first part if available.
+                        tool_output_content = ""
+                        if hasattr(tool_result_obj, 'content') and isinstance(tool_result_obj.content, list):
+                            if tool_result_obj.content and hasattr(tool_result_obj.content[0], 'text'):
+                                tool_output_content = tool_result_obj.content[0].text
+                            elif tool_result_obj.content: # Fallback for non-text content
                                 try:
-                                    # Poll the response queue for the result of *this specific* request.
-                                    response_id, status, result_data = response_queue.get(timeout=0.1)
-                                    if response_id != request_id:
-                                        # If a response for a different request is found, put it back
-                                        # and continue waiting for the correct one.
-                                        response_queue.put((response_id, status, result_data))
-                                        status = "PENDING" # Still waiting for our specific ID
-                                except queue.Empty:
-                                    pass 
+                                    tool_output_content = json.dumps([asdict(part) for part in tool_result_obj.content])
+                                except TypeError: # If not dataclasses
+                                    tool_output_content = str(tool_result_obj.content)
+                        else:
+                            tool_output_content = str(tool_result_obj) # Fallback if no .content or not a list
 
-                            # tool execution
-                            if status == "PENDING":
-                                error_message = f"Tool `{tool_name}` execution timed out after {max_tool_wait_time} seconds."
-                                message_placeholder.markdown(f"**Error:** {error_message}")
-                                full_response_content += f"**Error:** {error_message}\n"
-                            elif status == "SUCCESS":
-                                tool_result = result_data
-                                output_text = ""
-                                if hasattr(tool_result, 'content') and tool_result.content:
-                                    if isinstance(tool_result.content, list) and len(tool_result.content) > 0 and hasattr(tool_result.content[0], 'text'):
-                                        output_text = tool_result.content[0].text
-                                    elif hasattr(tool_result.content, 'text'):
-                                        output_text = tool_result.content.text
-                                    else:
-                                        output_text = str(tool_result.content) # Fallback for other content types
-                                else:
-                                    output_text = str(tool_result) # Fallback if no 'content' attribute
+                        current_workflow_steps.append(
+                            WorkflowStep(
+                                type="TOOL_RESULT",
+                                content="Received result.",
+                                details=tool_output_content, # Store raw output for render_workflow to format
+                            )
+                        )
+                        # Add tool output to LLM's message history for context in next turn
+                        st.session_state.llm_message_history.append(
+                            {"role": "tool_output", "content": tool_output_content}
+                        )
+                        
+                        status_placeholder.update(
+                            label=f"🧠 Processing results from {tool_name}...",
+                            state="running",
+                        )
+                        with workflow_display_container.container():
+                            render_workflow(current_workflow_steps, container=st)
 
-                                tool_output_display = f"**Tool Output:**\n```\n{output_text}\n```"
-                                message_placeholder.markdown(full_response_content + tool_output_display)
-                                full_response_content += tool_output_display + "\n"
-                            else: # status == "ERROR"
-                                error_message = f"Error executing tool `{tool_name}`: {result_data}"
-                                message_placeholder.markdown(f"**Error:** {error_message}")
-                                full_response_content += f"**Error:** {error_message}\n"
+                    except Exception as tool_ex:
+                        error_msg = f"Error during tool '{tool_name}' execution: {tool_ex}"
+                        current_workflow_steps.append(
+                            WorkflowStep(type="ERROR", content=error_msg)
+                        )
+                        st.session_state.llm_message_history.append(
+                            {"role": "tool_output", "content": f"ERROR: {error_msg}"}
+                        )
+                        status_placeholder.update(
+                            label=f"❌ Tool Error: {error_msg[:100]}...",
+                            state="error", expanded=True
+                        )
+                        message_placeholder.error(f"Tool error: {error_msg}")
+                        with workflow_display_container.container():
+                            render_workflow(current_workflow_steps, container=st)
+                        # Optionally break or continue based on error handling strategy
+                        # For now, we'll let it try other tools or proceed.
 
-                    except Exception as e:
-                        error_message = f"Unexpected error during tool execution: {e}"
-                        message_placeholder.markdown(f"**Error:** {error_message}")
-                        full_response_content += f"**Error:** {error_message}\n"
-            else:
-                full_response_content = response
-                message_placeholder.markdown(full_response_content)
+            # After all tool calls, potentially call LLM again with updated history
+            # This is simplified; a real agent might loop LLM->Tool->LLM
+            # For this example, we re-call LLM to get a final natural language response
+            # based on new tool outputs.
+            status_placeholder.update(label="🧠 Finalizing response...", state="running")
+            _, final_llm_response = await call_llm(
+                st.session_state.llm_message_history, 
+                llm_functions, # Pass tools again just in case LLM needs them for final thought
+                llm_config # Pass the llm_config dictionary
+            )
+            accumulated_response_content = final_llm_response
+            
+        else: # LLM returned a direct text response
+            accumulated_response_content = llm_response_or_calls
+        
+        # Display the final LLM response
+        final_display_content = accumulated_response_content.strip()
+        message_placeholder.markdown(final_display_content or "_No text response_")
 
-        st.session_state.messages.append({"role": "assistant", "content": full_response_content.strip()})
-    
-    st.experimental_rerun()
+        if final_display_content:
+            current_workflow_steps.append(
+                WorkflowStep(
+                    type="LLM_RESPONSE",
+                    content="Final response generated.",
+                    details={"response_text": final_display_content},
+                )
+            )
+        # Append assistant's final response to LLM's history
+        st.session_state.llm_message_history.append(
+            {"role": "assistant", "content": final_display_content}
+        )
+
+        final_status_message = "Completed."
+        if tool_call_count > 0:
+            final_status_message += f" Processed {tool_call_count} tool call(s)."
+        current_workflow_steps.append(
+            WorkflowStep(type="FINAL_STATUS", content=final_status_message)
+        )
+
+        status_placeholder.update(
+            label=f"✅ {final_status_message}", state="complete", expanded=False
+        )
+
+        with workflow_display_container.container():
+            render_workflow(current_workflow_steps, container=st)
+
+        # --- Store results in session state for UI display ---
+        last_user_message_index = -1
+        for i in range(len(st.session_state.messages) - 1, -1, -1):
+            if st.session_state.messages[i]["role"] == "user":
+                last_user_message_index = i
+                break
+
+        assistant_message = {
+            "role": "assistant",
+            "content": final_display_content,
+            "workflow_steps": [step.to_dict() for step in current_workflow_steps],
+        }
+        if last_user_message_index != -1:
+            st.session_state.messages.insert(
+                last_user_message_index + 1, assistant_message
+            )
+        else:
+            st.session_state.messages.append(assistant_message)
+
+    except Exception as e:
+        error_message = f"An unexpected error occurred in process_chat: {str(e)}"
+        st.error(error_message)
+        current_workflow_steps.append(WorkflowStep(type="ERROR", content=error_message))
+        try:
+            with workflow_display_container.container():
+                render_workflow(current_workflow_steps, container=st)
+        except Exception as render_e:
+            st.error(f"Additionally, failed to render workflow after error: {render_e}")
+
+        status_placeholder.update(
+            label=f"❌ Error: {error_message[:100]}...", state="error", expanded=True
+        )
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": f"Error: {error_message}",
+                "workflow_steps": [step.to_dict() for step in current_workflow_steps],
+            }
+        )
+        # Ensure error is also reflected in LLM history for debugging in subsequent turns
+        st.session_state.llm_message_history.append(
+            {"role": "assistant", "content": f"Error: {error_message}"}
+        )
+
+    finally:
+        # --- Critical Clean-up for Async Objects in Streamlit ---
+        # It's crucial to exit the AsyncExitStack within the same async loop
+        # it was entered to properly close all managed resources (like stdio clients).
+        try:
+            if st.session_state.mcp_client_stack is not None:
+                await st.session_state.mcp_client_stack.__aexit__(None, None, None)
+        except Exception as cleanup_exc:
+            print("MCP clean‑up error during finalizer:", cleanup_exc, file=sys.stderr)
+        finally:
+            st.session_state.mcp_client_stack = None
+            st.session_state.mcp_client_session = None # Ensure new session is created next turn
+            st.session_state.active_mcp_clients_raw = []
+
+def display_chat_history():
+    """Displays the chat history from st.session_state.messages."""
+    for idx, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant" and "workflow_steps" in message:
+                workflow_history_container = st.container()
+                workflow_steps = []
+                if isinstance(message["workflow_steps"], list):
+                    for step_dict in message["workflow_steps"]:
+                        if isinstance(step_dict, dict):
+                            workflow_steps.append(
+                                WorkflowStep(
+                                    type=step_dict.get("type", "UNKNOWN"),
+                                    content=step_dict.get("content", ""),
+                                    details=step_dict.get("details", {}),
+                                )
+                            )
+                if workflow_steps:
+                    render_workflow(
+                        workflow_steps, container=workflow_history_container
+                    )
+
+            st.markdown(message["content"], unsafe_allow_html=True)
+
+
+async def main():
+    """Main application entry point."""
+    mcp_tools = await get_mcp_tools()
+    render_sidebar(mcp_tools)
+    display_chat_history()
+
+    if prompt := st.chat_input(
+        "Ask something... (e.g., 'What files are in the root directory?')"
+    ):
+        await process_chat(prompt)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        # Note: Reliable async cleanup on Streamlit shutdown is still complex.
+        pass
+
