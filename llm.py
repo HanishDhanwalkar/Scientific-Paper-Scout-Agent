@@ -1,5 +1,3 @@
-import json
-
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
@@ -30,7 +28,6 @@ def convert_to_llm_tool(tool):
             }
         }
     }
-
     return tool_schema
 
 def get_llm_client():
@@ -94,5 +91,4 @@ def call_llm(message_history, functions):
         return tool_call_present, functions_to_call
 
     except Exception as e:
-        # print(f"Error calling LLM: {e}")
         return tool_call_present, "Error calling LLM: " + str(e)
