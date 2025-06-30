@@ -15,7 +15,7 @@ for windows : `.\.venv\Scripts\activate`
 
 `pip install -r requirements.txt`
 
-Rename `.env_EXAMPLE` to `.env` and paste your api keys. 
+Paste your api keys in `.env_EXAMPLE` and Rename the file to `.env`
 (Optional: leave as it is for models that won't be used)
 
 Configure LLMs in config.py file\
@@ -24,12 +24,13 @@ edit (in config.py):\
 `CURRENT_SUMMARIZER_LLM_PROVIDER = "ollama"`  # Change this to switch LLMs,  Options: `"ollama"`, `"openai"`, `"claude"`, `"gemini"`
 
 ## Usage
+Run MCP server:\
+`mcp run server.py`
 
-For CLI usage run:
-`python main.py`
 
-For Web UI chatbot run: 
-`streamlit run app.py`
+| For CLI usage         |  For Web UI chatbot       |
+| --------------------- | ------------------------- |
+| `python main.py`      | `streamlit run app.py`    |
 
 
 ## ScreenShots
