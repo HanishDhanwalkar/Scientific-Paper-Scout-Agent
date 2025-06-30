@@ -88,6 +88,7 @@ def call_llm(message_history, functions):
             print("No tool calls found in response.")
             return tool_call_present, response.content
 
+        print("LLM calling complete....")
         return tool_call_present, functions_to_call
 
     except Exception as e:
