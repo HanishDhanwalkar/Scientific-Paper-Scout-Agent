@@ -33,8 +33,14 @@ For Web UI chatbot run:
 
 
 ## ScreenShots
-### CLI tool:
+## CLI tool:
 
-<img src="./assets/Screenshot 2025-06-28 235621.png" width=1000px>
-<img src="./assets/Screenshot 2025-06-28 235816.png" width=1000px>
-<img src="./assets/Screenshot 2025-06-28 235859.png" width=1000px>
+<img src="./assets/Screenshot 2025-06-28 235621.png" width=800px>
+<img src="./assets/Screenshot 2025-06-28 235816.png" width=800px>
+<img src="./assets/Screenshot 2025-06-28 235859.png" width=800px>
+
+## Web UI (Using Streamlit)
+
+<img src="./assets/Screenshot 2025-06-30 232050.png" width=800px>
+<img src="./assets/Screenshot 2025-06-30 232128.png" width=800px>
+<img src="./assets/Screenshot 2025-06-30 232312.png" width=800px>
